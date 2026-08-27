@@ -1,0 +1,7 @@
+# Optional: the system tray icon. Without these the widget runs unchanged,
+# just without a tray icon.
+pystray>=0.19
+pillow>=10.0
+
+# Build only, not needed at runtime.
+# pyinstaller>=6.0

@@ -1,0 +1,34 @@
+# --- stays on the local machine only, never published -----------------------
+# HANDOFF.md is the working context for continuing this project. It contains
+# local paths, machine details and personal network information. The file is
+# NOT deleted -- git simply does not track it.
+HANDOFF.md
+
+# Backups made before edits
+*.bak
+*.bak-*
+*.orig
+
+# --- build output -----------------------------------------------------------
+build/
+dist/
+*.spec.bak
+
+# --- Python -----------------------------------------------------------------
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- editors / OS -----------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
