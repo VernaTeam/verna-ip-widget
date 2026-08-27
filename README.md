@@ -1,5 +1,7 @@
 # Verna IP Widget
 
+**English** · [فارسی](README.fa.md)
+
 A small always-on-top desktop widget for Windows that answers one question at a
 glance: **where does my traffic come out, and is it going through a tunnel?**
 
