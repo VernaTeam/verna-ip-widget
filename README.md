@@ -95,7 +95,12 @@ three seconds and will:
 | `Shift` + wheel | Opacity |
 | `Ctrl+Alt+I` | Summon from anywhere |
 
-## Install and run
+## Download
+
+Grab `VernaIPWidget.exe` from the [latest release](https://github.com/VernaTeam/verna-ip-widget/releases/latest) and run it. It is a
+single console-less file with no installer and no dependencies.
+
+## Run from source
 
 Requires Windows and Python 3.10+.
 
