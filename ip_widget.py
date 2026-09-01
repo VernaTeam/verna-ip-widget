@@ -1,8 +1,21 @@
-"""Verna IP Widget (v3.5).
+"""Verna IP Widget (v3.5.2).
 
 A tiny always-on-top, draggable desktop widget for Windows that shows the
 current public IP, country name, country flag and city. VPN connect and
 disconnect are reflected within ~2-3 seconds.
+
+v3.5.2 fixes:
+- The traffic-path badge no longer trusts the registry alone. A VPN client
+  that exits without clearing ProxyEnable leaves Windows advertising a proxy
+  that nothing serves; the badge said PROXY while urllib quietly fell back to
+  a direct connection and returned the user's real domestic IP. The badge now
+  reads DIRECT when the configured proxy refuses connections, decided by a
+  loopback liveness probe and confirmed by which transport actually carried
+  the fetch.
+- A failed fetch no longer contradicts itself. It used to print "No
+  connection" while leaving the previous IP, city and ISP on screen. The last
+  reading now survives but is dimmed and marked "(last known)", and the
+  no-history case clears the detail lines instead.
 
 v3.5 features:
 - The right-click menu acts on the FIRST click. Every handler had been
@@ -182,6 +195,13 @@ BORDER = "#3a3f55"
 ACCENT = "#4cc38a"       # also used for the "fresh" status dot and IP-change flash
 STATUS_FETCHING = "#d29922"
 STATUS_ERROR = "#e5534b"
+
+# A configured system proxy that refuses connections is not a proxy in use.
+# Only loopback proxies are probed on the timer: a refusal there is instant,
+# while an unreachable remote address would block the UI thread for the whole
+# timeout. Remote proxies fall back to the transport signal from the fetch.
+PROXY_PROBE_TIMEOUT = 0.25
+LOOPBACK_PREFIXES = ("127.", "localhost", "::1")
 
 # --- traffic-path badge ---
 PATH_VPN = "VPN"
@@ -399,6 +419,57 @@ def find_adapter_for_ip(local_ip: str) -> Optional[tuple[str, int]]:
     return None
 
 
+def parse_proxy_endpoint(proxy: str) -> Optional[tuple[str, int]]:
+    """Pull (host, port) out of a Windows ProxyServer value.
+
+    The value takes several shapes: a bare "host:port", a scheme-qualified
+    "http://host:port", or a per-protocol list
+    "http=host:port;https=host:port". Any single endpoint is enough to probe.
+    """
+    if not proxy:
+        return None
+    candidate = proxy.strip()
+    if ";" in candidate:  # per-protocol list; the first entry will do
+        candidate = candidate.split(";", 1)[0]
+    if "=" in candidate:  # "http=host:port"
+        candidate = candidate.split("=", 1)[1]
+    if "://" in candidate:  # "http://host:port"
+        candidate = candidate.split("://", 1)[1]
+    candidate = candidate.strip().rstrip("/")
+    if ":" not in candidate:
+        return None
+    host, _, port_text = candidate.rpartition(":")
+    try:
+        return host, int(port_text)
+    except ValueError:
+        return None
+
+
+def is_loopback_proxy(proxy: str) -> bool:
+    endpoint = parse_proxy_endpoint(proxy)
+    if endpoint is None:
+        return False
+    host = endpoint[0].lower().strip("[]")
+    return host.startswith(LOOPBACK_PREFIXES)
+
+
+def is_proxy_reachable(proxy: str) -> bool:
+    """True if something is listening on the configured proxy endpoint.
+
+    A VPN client that exits without clearing ProxyEnable leaves the registry
+    claiming a proxy that nothing serves. Reporting PROXY in that state is
+    wrong: traffic is going out direct.
+    """
+    endpoint = parse_proxy_endpoint(proxy)
+    if endpoint is None:
+        return False
+    try:
+        with socket.create_connection(endpoint, timeout=PROXY_PROBE_TIMEOUT):
+            return True
+    except OSError:
+        return False
+
+
 def looks_like_vpn(adapter_name: str, if_type: int) -> bool:
     if if_type in VIRTUAL_IF_TYPES:
         return True
@@ -425,6 +496,8 @@ class NetworkState:
     proxy: str = ""
     adapter: str = ""
     if_type: int = 0
+    # None = not probed yet. False = configured but nothing is listening.
+    proxy_alive: Optional[bool] = None
 
     @property
     def signature(self) -> str:
@@ -432,12 +505,17 @@ class NetworkState:
 
     @property
     def path(self) -> str:
-        """Classify the egress path for the badge."""
+        """Classify the egress path for the badge.
+
+        A configured-but-dead proxy reads as DIRECT, because that is where the
+        traffic actually goes: urllib falls back to a direct connection and
+        the widget itself gets its data that way.
+        """
         if not self.local_ip:
             return PATH_OFFLINE
         if looks_like_vpn(self.adapter, self.if_type):
             return PATH_VPN
-        if self.proxy:
+        if self.proxy and self.proxy_alive is not False:
             return PATH_PROXY
         return PATH_DIRECT
 
@@ -469,6 +547,14 @@ def read_network_state(with_adapter: bool = True) -> NetworkState:
 
     state = NetworkState(local_ip=local_ip, proxy=str(proxy))
     if with_adapter:
+        # Both of these are behind the flag deliberately. The 2-second change
+        # poll uses the fast path, because a closed loopback port does NOT
+        # refuse instantly on Windows -- it burns the whole timeout, and that
+        # would stall the UI thread every tick. Here it costs one probe per
+        # actual network change, and the transport signal from the next fetch
+        # corrects the badge anyway.
+        if state.proxy and is_loopback_proxy(state.proxy):
+            state.proxy_alive = is_proxy_reachable(state.proxy)
         found = find_adapter_for_ip(local_ip)
         if found is not None:
             state.adapter, state.if_type = found
@@ -530,12 +616,23 @@ def _http_get(url: str, use_system_proxy: bool) -> bytes:
         return response.read()
 
 
-def _http_get_resilient(url: str) -> bytes:
-    """Try via the current system proxy first, then fall back to direct."""
+def _http_get_resilient(url: str) -> tuple[bytes, bool]:
+    """Try via the current system proxy first, then fall back to direct.
+
+    Returns (body, proxy_path_worked). The second value is ground truth about
+    where the traffic went: if the system proxy is configured but dead, the
+    first attempt fails and the direct fallback is what actually succeeded.
+    Discarding that was why a stale ProxyEnable made the badge lie.
+    """
     try:
-        return _http_get(url, use_system_proxy=True)
+        return _http_get(url, use_system_proxy=True), True
     except Exception:
-        return _http_get(url, use_system_proxy=False)
+        return _http_get(url, use_system_proxy=False), False
+
+
+def _http_get_body(url: str) -> bytes:
+    """_http_get_resilient for callers that do not care about the transport."""
+    return _http_get_resilient(url)[0]
 
 
 def _parse_ip_api(raw: bytes) -> Optional[GeoInfo]:
@@ -591,21 +688,27 @@ GEO_APIS: list[tuple[str, Callable[[bytes], Optional[GeoInfo]]]] = [
 ]
 
 
-def fetch_geo() -> Optional[GeoInfo]:
-    """Try each geolocation API in order; return the first valid result."""
+def fetch_geo() -> tuple[Optional[GeoInfo], Optional[bool]]:
+    """Try each geolocation API in order; return the first valid result.
+
+    Also returns whether the system-proxy path is what carried the request,
+    or None if nothing succeeded. That is the most reliable statement the
+    widget can make about where its traffic actually went.
+    """
     for url, parser in GEO_APIS:
         try:
-            info = parser(_http_get_resilient(url))
+            body, via_proxy = _http_get_resilient(url)
+            info = parser(body)
             if info and info.ip and info.country_code:
-                return info
+                return info, via_proxy
         except Exception:
             continue
-    return None
+    return None, None
 
 
 def fetch_flag_png(country_code: str, size: str) -> Optional[bytes]:
     try:
-        return _http_get_resilient(FLAG_URL_TEMPLATE.format(size=size, cc=country_code))
+        return _http_get_body(FLAG_URL_TEMPLATE.format(size=size, cc=country_code))
     except Exception:
         return None
 
@@ -1435,12 +1538,13 @@ class IPWidget:
     def _fetch_worker(self, seq: int) -> None:
         """Runs in a background thread. Only raw bytes cross the thread
         boundary; all tkinter objects are created on the main thread."""
-        info = fetch_geo()
+        info, via_proxy = fetch_geo()
         flag_size = self._tier["flag"]
         flag_png: Optional[bytes] = None
         if info and (info.country_code, flag_size) not in self._flag_cache:
             flag_png = fetch_flag_png(info.country_code, flag_size)
-        self._post(self._apply_result, seq, info, flag_png, flag_size)
+        self._post(self._apply_result, seq, info, flag_png, flag_size,
+                   via_proxy)
 
     def _ensure_flag_async(self, country_code: str) -> None:
         """Fetch the flag asset for the current tier size if not cached."""
@@ -1467,14 +1571,38 @@ class IPWidget:
             pass
 
     def _apply_result(self, seq: int, info: Optional[GeoInfo],
-                      flag_png: Optional[bytes], flag_size: str) -> None:
+                      flag_png: Optional[bytes], flag_size: str,
+                      via_proxy: Optional[bool] = None) -> None:
         if seq != self._fetch_seq:
             return  # stale result from an abandoned fetch; a newer one owns the UI
         self._fetching = False
+
+        # Ground truth beats the registry: if a proxy is configured but the
+        # direct fallback is what carried the request, nothing is listening on
+        # it and the real path is DIRECT.
+        if via_proxy is not None and self._net_state.proxy:
+            self._net_state.proxy_alive = via_proxy
+
         if info is None:
             self.status_dot.config(fg=STATUS_ERROR)
-            self.country_label.config(text="No connection", fg=FG_ERROR)
-            self.flag_label.config(image="", text="!")
+            if self._current_info is None:
+                self.country_label.config(text="No connection", fg=FG_ERROR)
+                self.flag_label.config(image="", text="!")
+                self.detail_label.config(text="", fg=FG_DIM)
+                self._render_isp()
+            else:
+                # Keep the last reading but mark it stale. Printing "No
+                # connection" above a live-looking IP, city and ISP made the
+                # widget contradict itself.
+                self.country_label.config(text=self._current_info.country, fg=FG_DIM)
+                if self._copy_feedback_job is None:
+                    city = self._current_info.city
+                    city_part = f"  \u00b7  {city}" if city else ""
+                    self.detail_label.config(
+                        text=f"{self._current_info.ip}{city_part}   (last known)",
+                        fg=FG_DIM,
+                    )
+            self._render_path_badge()
             return
 
         previous_ip = self._current_info.ip if self._current_info else None

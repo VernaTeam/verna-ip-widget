@@ -15,11 +15,14 @@ from ip_widget import (
     PATH_OFFLINE,
     PATH_PROXY,
     PATH_VPN,
+    GeoInfo,
     NetworkState,
     _parse_ip_api,
     _parse_ipinfo,
     _parse_ipwhois,
+    is_loopback_proxy,
     looks_like_vpn,
+    parse_proxy_endpoint,
 )
 
 
@@ -157,6 +160,65 @@ class VpnAdapterHeuristicTests(unittest.TestCase):
             self.assertFalse(looks_like_vpn(name, 6), name)
 
 
+class ProxyEndpointTests(unittest.TestCase):
+    """Windows writes ProxyServer in several shapes."""
+
+    def test_bare_host_port(self) -> None:
+        self.assertEqual(parse_proxy_endpoint("127.0.0.1:12334"), ("127.0.0.1", 12334))
+
+    def test_scheme_qualified(self) -> None:
+        self.assertEqual(parse_proxy_endpoint("http://10.0.0.5:3128"), ("10.0.0.5", 3128))
+
+    def test_per_protocol_list_uses_the_first_entry(self) -> None:
+        self.assertEqual(
+            parse_proxy_endpoint("http=127.0.0.1:8080;https=127.0.0.1:8081"),
+            ("127.0.0.1", 8080),
+        )
+
+    def test_unparseable_values_return_none(self) -> None:
+        for value in ("", "garbage", "host-without-port", "host:notaport"):
+            self.assertIsNone(parse_proxy_endpoint(value), value)
+
+    def test_loopback_detection(self) -> None:
+        self.assertTrue(is_loopback_proxy("127.0.0.1:1080"))
+        self.assertTrue(is_loopback_proxy("http://localhost:8080"))
+        self.assertFalse(is_loopback_proxy("http://10.0.0.5:3128"))
+        self.assertFalse(is_loopback_proxy(""))
+
+
+class DeadProxyTests(unittest.TestCase):
+    """A VPN client that exits without clearing ProxyEnable leaves the
+    registry advertising a proxy that nothing serves. Reporting PROXY then is
+    wrong: urllib falls back to a direct connection and that is where the
+    traffic actually goes. This is the bug behind a widget showing PROXY next
+    to a domestic ISP.
+    """
+
+    def _state(self, **kw):
+        base = dict(local_ip="192.168.1.10", proxy="http://127.0.0.1:12334",
+                    adapter="Generic 802.11ac Wireless Adapter", if_type=71)
+        base.update(kw)
+        return NetworkState(**base)
+
+    def test_dead_proxy_reads_as_direct(self) -> None:
+        self.assertEqual(self._state(proxy_alive=False).path, PATH_DIRECT)
+
+    def test_live_proxy_reads_as_proxy(self) -> None:
+        self.assertEqual(self._state(proxy_alive=True).path, PATH_PROXY)
+
+    def test_unprobed_proxy_trusts_the_registry(self) -> None:
+        # None means "not probed yet"; the registry is the best guess until
+        # a probe or a fetch says otherwise.
+        self.assertEqual(self._state(proxy_alive=None).path, PATH_PROXY)
+
+    def test_tunnel_outranks_even_a_live_proxy(self) -> None:
+        state = self._state(adapter="WireGuard Tunnel", if_type=6, proxy_alive=True)
+        self.assertEqual(state.path, PATH_VPN)
+
+    def test_no_route_is_offline_regardless_of_proxy(self) -> None:
+        self.assertEqual(self._state(local_ip="", proxy_alive=True).path, PATH_OFFLINE)
+
+
 class EventBindingTests(unittest.TestCase):
     """One user gesture must reach its handler exactly once.
 
@@ -243,6 +305,49 @@ class EventBindingTests(unittest.TestCase):
 
     def test_control_wheel_steps_size_once(self) -> None:
         self._fire("scale", "<MouseWheel>", delta=120, state=0x0004)
+
+    def test_failed_fetch_does_not_leave_a_contradictory_reading(self) -> None:
+        """A failed fetch used to print "No connection" while leaving the
+        previous IP, city and ISP on screen, so the widget contradicted
+        itself. The last reading may stay, but it must be marked."""
+        w = self.widget
+        w._current_info = GeoInfo(ip="203.0.113.7", country="Germany",
+                                  country_code="de", city="Berlin",
+                                  isp="Example GmbH")
+        w._render_isp()
+        w._apply_result(w._fetch_seq, None, None, w._tier["flag"])
+        w.root.update()
+
+        detail = w.detail_label.cget("text")
+        self.assertIn("203.0.113.7", detail, "the last reading should survive")
+        self.assertIn("last known", detail, "and it must be marked as stale")
+        self.assertNotEqual(
+            w.country_label.cget("text"), "No connection",
+            "'No connection' above a full IP is the contradiction being fixed",
+        )
+
+    def test_failed_fetch_with_no_history_says_no_connection(self) -> None:
+        w = self.widget
+        w._current_info = None
+        w._apply_result(w._fetch_seq, None, None, w._tier["flag"])
+        w.root.update()
+        self.assertEqual(w.country_label.cget("text"), "No connection")
+        self.assertEqual(w.detail_label.cget("text"), "")
+
+    def test_direct_fallback_marks_the_proxy_dead(self) -> None:
+        """If a proxy is configured but the direct fallback carried the
+        request, the badge must stop claiming PROXY."""
+        w = self.widget
+        w._net_state = NetworkState(local_ip="192.168.1.10",
+                                    proxy="http://127.0.0.1:12334",
+                                    adapter="Generic 802.11ac Wireless Adapter",
+                                    if_type=71, proxy_alive=True)
+        info = GeoInfo(ip="203.0.113.7", country="Iran", country_code="ir",
+                       city="Rasht", isp="Example ISP")
+        w._apply_result(w._fetch_seq, info, None, w._tier["flag"], via_proxy=False)
+        w.root.update()
+        self.assertIs(w._net_state.proxy_alive, False)
+        self.assertEqual(w.path_badge.cget("text"), PATH_DIRECT)
 
     def test_only_the_toplevel_carries_the_bindings(self) -> None:
         w = self.widget
