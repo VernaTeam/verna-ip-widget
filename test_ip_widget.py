@@ -361,6 +361,99 @@ class EventBindingTests(unittest.TestCase):
             )
 
 
+class OfflineFetchTests(unittest.TestCase):
+    """A fetch with no route must cost nothing.
+
+    The widget autostarts from the Run key before Windows has finished
+    bringing the network up. Walking three APIs over two transports at an
+    8-second timeout each burns most of a minute to discover what the routing
+    table already answered for free, and "No connection" stays on screen the
+    whole time.
+    """
+
+    def setUp(self) -> None:
+        import ip_widget
+        self.module = ip_widget
+        self._real_state = ip_widget.read_network_state
+        self._real_get = ip_widget._http_get_resilient
+
+    def tearDown(self) -> None:
+        self.module.read_network_state = self._real_state
+        self.module._http_get_resilient = self._real_get
+
+    def test_no_route_skips_every_http_call(self) -> None:
+        self.module.read_network_state = (
+            lambda with_adapter=True: self.module.NetworkState(local_ip="")
+        )
+        attempted: list = []
+
+        def record(url):
+            # Must NOT raise to signal the failure: fetch_geo wraps every
+            # attempt in `except Exception: continue`, so an exception here
+            # would be swallowed and the test would pass either way.
+            attempted.append(url)
+            payload = json.dumps({
+                "status": "success", "query": "203.0.113.7",
+                "country": "Testland", "countryCode": "TL",
+            }).encode()
+            return payload, False
+
+        self.module._http_get_resilient = record
+        result = self.module.fetch_geo()
+        self.assertEqual(attempted, [], "HTTP was attempted with no route")
+        self.assertEqual(result, (None, None))
+
+    def test_a_route_still_reaches_the_apis(self) -> None:
+        self.module.read_network_state = (
+            lambda with_adapter=True: self.module.NetworkState(local_ip="192.168.1.10")
+        )
+        seen = []
+
+        def fake_get(url):
+            seen.append(url)
+            payload = json.dumps({
+                "status": "success", "query": "203.0.113.7",
+                "country": "Testland", "countryCode": "TL", "city": "Testville",
+                "isp": "Test ISP",
+            }).encode()
+            return payload, False
+
+        self.module._http_get_resilient = fake_get
+        info, via_proxy = self.module.fetch_geo()
+        assert info is not None
+        self.assertEqual(info.ip, "203.0.113.7")
+        self.assertFalse(via_proxy)
+        self.assertEqual(len(seen), 1, "should stop at the first API that answers")
+
+
+class RetryBackoffTests(unittest.TestCase):
+    """A failed fetch retries on a short backoff rather than waiting out the
+    full poll interval, and a success resets the ladder."""
+
+    def test_backoff_doubles_and_caps_at_the_poll_interval(self) -> None:
+        import ip_widget
+        delay = ip_widget.RETRY_BASE_MS
+        ladder = []
+        for _ in range(6):
+            ladder.append(delay)
+            delay = min(delay * 2, ip_widget.RETRY_MAX_MS)
+
+        self.assertEqual(ladder[0], ip_widget.RETRY_BASE_MS)
+        self.assertEqual(ladder[1], ip_widget.RETRY_BASE_MS * 2)
+        self.assertEqual(ladder[2], ip_widget.RETRY_BASE_MS * 4)
+        for step in ladder:
+            self.assertLessEqual(step, ip_widget.RETRY_MAX_MS)
+        self.assertEqual(ladder[-1], ip_widget.RETRY_MAX_MS,
+                         "the ladder must settle at the poll interval")
+
+    def test_first_retry_is_much_faster_than_the_poll(self) -> None:
+        import ip_widget
+        self.assertLess(
+            ip_widget.RETRY_BASE_MS, ip_widget.POLL_INTERVAL_MS / 4,
+            "the point of the backoff is to recover well before the next poll",
+        )
+
+
 class MalformedInputTests(unittest.TestCase):
     def test_invalid_json_raises_for_caller_to_catch(self) -> None:
         # fetch_geo() wraps each parser call in try/except; parsers themselves

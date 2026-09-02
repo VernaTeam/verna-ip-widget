@@ -1,8 +1,20 @@
-"""Verna IP Widget (v3.5.2).
+"""Verna IP Widget (v3.5.3).
 
 A tiny always-on-top, draggable desktop widget for Windows that shows the
 current public IP, country name, country flag and city. VPN connect and
 disconnect are reflected within ~2-3 seconds.
+
+v3.5.3 fixes:
+- "No connection" no longer lingers for over a minute after a Windows boot.
+  The widget autostarts from the Run key before the network is usable, and
+  because the local route already exists no signature change fires to force a
+  re-fetch. Two changes: a failed fetch now retries on a 2s/4s/8s backoff
+  instead of waiting out the 15s poll, and a fetch with no local route at all
+  returns immediately (0.6 ms measured) rather than walking three APIs over
+  two transports at an 8-second timeout each, which cost up to 48 seconds to
+  learn what the routing table already knew.
+- Fetch failures are logged. The log previously recorded startup and network
+  changes but was silent about the thing that actually goes wrong.
 
 v3.5.2 fixes:
 - The traffic-path badge no longer trusts the registry alone. A VPN client
@@ -140,7 +152,16 @@ NET_CHECK_INTERVAL_MS = 2_000    # local (zero-traffic) network signature check
 NET_CHANGE_DEBOUNCE_MS = 1_200   # wait for the network to settle after a change
 HTTP_TIMEOUT = 8  # seconds (covers connect/read, NOT DNS resolution)
 FETCH_WATCHDOG_S = 45  # abandon a fetch thread stuck longer than this
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) VernaIPWidget/3.4"
+
+# After a failed fetch, retry on a short backoff instead of waiting out the
+# full poll interval. At boot the widget is launched from the Run key before
+# Windows has finished bringing the network up: the route already exists, so
+# no signature change fires, and a failed cycle can cost 3 APIs x 2 transports
+# x HTTP_TIMEOUT before the 15s poll even comes round again. That left "No
+# connection" on screen for over a minute on a machine that was online.
+RETRY_BASE_MS = 2_000
+RETRY_MAX_MS = POLL_INTERVAL_MS
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) VernaIPWidget/3.5.3"
 
 CONFIG_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_NAME
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -695,6 +716,13 @@ def fetch_geo() -> tuple[Optional[GeoInfo], Optional[bool]]:
     or None if nothing succeeded. That is the most reliable statement the
     widget can make about where its traffic actually went.
     """
+    if not read_network_state(with_adapter=False).local_ip:
+        # No route at all. Walking every API and both transports here would
+        # burn the better part of a minute to learn what the routing table
+        # already said for free.
+        LOG.info("no local route; skipping the geolocation fetch")
+        return None, None
+
     for url, parser in GEO_APIS:
         try:
             body, via_proxy = _http_get_resilient(url)
@@ -829,6 +857,8 @@ class IPWidget:
         self._net_state = read_network_state()
         self._net_signature = self._net_state.signature
         self._net_change_job: Optional[str] = None  # pending debounced fetch
+        self._retry_job: Optional[str] = None       # pending backoff retry
+        self._retry_delay_ms = RETRY_BASE_MS
 
         # --- self-heal state ---
         self._heal_tick = 0
@@ -1527,6 +1557,7 @@ class IPWidget:
         if (not force and self._fetching
                 and (now - self._fetch_started_at) < FETCH_WATCHDOG_S):
             return
+        self._cancel_retry()
         self._fetching = True
         self._fetch_started_at = now
         self._fetch_seq += 1
@@ -1534,6 +1565,23 @@ class IPWidget:
         threading.Thread(
             target=self._fetch_worker, args=(self._fetch_seq,), daemon=True
         ).start()
+
+    def _cancel_retry(self) -> None:
+        if self._retry_job is not None:
+            self.root.after_cancel(self._retry_job)
+            self._retry_job = None
+
+    def _schedule_retry(self) -> None:
+        """Re-fetch soon after a failure, backing off toward the poll rate."""
+        self._cancel_retry()
+        delay = self._retry_delay_ms
+        LOG.info("fetch failed; retrying in %.0fs", delay / 1000)
+        self._retry_job = self.root.after(delay, self._on_retry)
+        self._retry_delay_ms = min(delay * 2, RETRY_MAX_MS)
+
+    def _on_retry(self) -> None:
+        self._retry_job = None
+        self._force_fetch()
 
     def _fetch_worker(self, seq: int) -> None:
         """Runs in a background thread. Only raw bytes cross the thread
@@ -1584,6 +1632,7 @@ class IPWidget:
             self._net_state.proxy_alive = via_proxy
 
         if info is None:
+            self._schedule_retry()
             self.status_dot.config(fg=STATUS_ERROR)
             if self._current_info is None:
                 self.country_label.config(text="No connection", fg=FG_ERROR)
@@ -1604,6 +1653,10 @@ class IPWidget:
                     )
             self._render_path_badge()
             return
+
+        # Back to a clean slate: the next failure starts the backoff over.
+        self._cancel_retry()
+        self._retry_delay_ms = RETRY_BASE_MS
 
         previous_ip = self._current_info.ip if self._current_info else None
         self._current_info = info
@@ -1727,6 +1780,7 @@ class IPWidget:
         """Flush pending settings, stop the tray icon, destroy the window."""
         LOG.info("exiting")
         self._shutting_down = True  # stop worker threads posting into a dead loop
+        self._cancel_retry()
         if self._save_job is not None:
             self.root.after_cancel(self._save_job)
         self._save_now()
