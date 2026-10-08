@@ -8,6 +8,9 @@ Run (Windows CMD, in the project directory):
 from __future__ import annotations
 
 import json
+import pathlib
+import shutil
+import tempfile
 import unittest
 
 from ip_widget import (
@@ -452,6 +455,90 @@ class RetryBackoffTests(unittest.TestCase):
             ip_widget.RETRY_BASE_MS, ip_widget.POLL_INTERVAL_MS / 4,
             "the point of the backoff is to recover well before the next poll",
         )
+
+
+class FlagDiskCacheTests(unittest.TestCase):
+    """Flags are immutable, so a download is kept forever.
+
+    The in-memory cache starts empty on every launch, so each Windows boot
+    re-downloaded the flag exactly when the network is least ready: the
+    country name arrived with the geolocation response while the flag stayed
+    a "[IR]" text placeholder. flagcdn is also intermittently unreachable
+    from some networks, which makes a permanent local copy worth more than
+    the speed.
+    """
+
+    def setUp(self) -> None:
+        import ip_widget
+        self.module = ip_widget
+        self._real_dir = ip_widget.FLAG_CACHE_DIR
+        self._real_get = ip_widget._http_get_body
+        self._tmp = tempfile.mkdtemp()
+        ip_widget.FLAG_CACHE_DIR = pathlib.Path(self._tmp)
+
+    def tearDown(self) -> None:
+        self.module.FLAG_CACHE_DIR = self._real_dir
+        self.module._http_get_body = self._real_get
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    PNG = b"\x89PNG\r\n\x1a\n" + b"fake flag bytes"
+
+    def test_a_cached_flag_is_served_without_touching_the_network(self) -> None:
+        self.module.save_flag_to_disk("ir", "32x24", self.PNG)
+
+        def explode(url):
+            raise AssertionError(f"network used for a cached flag: {url}")
+
+        self.module._http_get_body = explode
+        self.assertEqual(self.module.fetch_flag_png("ir", "32x24"), self.PNG)
+
+    def test_a_downloaded_flag_is_written_to_disk(self) -> None:
+        calls = []
+
+        def fake_get(url):
+            calls.append(url)
+            return self.PNG
+
+        self.module._http_get_body = fake_get
+        self.assertEqual(self.module.fetch_flag_png("de", "32x24"), self.PNG)
+        self.assertEqual(len(calls), 1)
+        # Second call must come off the disk.
+        self.assertEqual(self.module.fetch_flag_png("de", "32x24"), self.PNG)
+        self.assertEqual(len(calls), 1, "the second read should not hit the network")
+
+    def test_a_failed_download_caches_nothing(self) -> None:
+        def fail(url):
+            raise OSError("network down")
+
+        self.module._http_get_body = fail
+        self.assertIsNone(self.module.fetch_flag_png("fr", "32x24"))
+        self.assertIsNone(self.module.load_flag_from_disk("fr", "32x24"))
+
+    def test_a_truncated_file_is_ignored_rather_than_rendered(self) -> None:
+        path = self.module._flag_cache_path("gb", "32x24")
+        assert path is not None
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"not a png")
+        self.assertIsNone(self.module.load_flag_from_disk("gb", "32x24"))
+
+    def test_untrusted_country_codes_cannot_escape_the_cache_directory(self) -> None:
+        # The country code arrives in a third-party API response.
+        for code in ("../../evil", "..", "a", "abc", "IR", "i/r", "i\\r", ""):
+            self.assertIsNone(
+                self.module._flag_cache_path(code, "32x24"),
+                f"{code!r} was accepted as a path component",
+            )
+        for size in ("../x", "32x24/..", "", "x", "99999x1"):
+            self.assertIsNone(
+                self.module._flag_cache_path("ir", size),
+                f"{size!r} was accepted as a path component",
+            )
+
+    def test_a_valid_pair_resolves_inside_the_cache_directory(self) -> None:
+        path = self.module._flag_cache_path("ir", "32x24")
+        assert path is not None
+        self.assertEqual(path.parent, pathlib.Path(self._tmp))
+        self.assertEqual(path.name, "ir_32x24.png")
 
 
 class MalformedInputTests(unittest.TestCase):

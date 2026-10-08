@@ -1,8 +1,19 @@
-"""Verna IP Widget (v3.5.3).
+"""Verna IP Widget (v3.5.4).
 
 A tiny always-on-top, draggable desktop widget for Windows that shows the
 current public IP, country name, country flag and city. VPN connect and
 disconnect are reflected within ~2-3 seconds.
+
+v3.5.4 fixes:
+- Flags are cached on disk, so they appear with the country name instead of
+  lagging behind it after a Windows boot. The in-memory cache started empty
+  on every launch, which meant each boot re-downloaded the flag from flagcdn
+  exactly when the network was least ready; until it arrived the widget
+  showed a "[IR]" text placeholder. Measured 3250 ms over the network
+  against 0.3 ms from disk. flagcdn is also intermittently unreachable from
+  some networks, so a permanent local copy is worth more than the speed.
+  The country code comes from a third-party response and is validated before
+  it is used as a filename.
 
 v3.5.3 fixes:
 - "No connection" no longer lingers for over a minute after a Windows boot.
@@ -126,6 +137,7 @@ import json
 import logging
 import logging.handlers
 import os
+import re
 import socket
 import sys
 import tempfile
@@ -161,7 +173,7 @@ FETCH_WATCHDOG_S = 45  # abandon a fetch thread stuck longer than this
 # connection" on screen for over a minute on a machine that was online.
 RETRY_BASE_MS = 2_000
 RETRY_MAX_MS = POLL_INTERVAL_MS
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) VernaIPWidget/3.5.3"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) VernaIPWidget/3.5.4"
 
 CONFIG_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_NAME
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -197,6 +209,14 @@ GA_ROOT = 2
 SW_SHOWNOACTIVATE = 4  # un-hide / un-minimise without stealing focus
 
 FLAG_URL_TEMPLATE = "https://flagcdn.com/{size}/{cc}.png"
+# Flags are immutable, so a download is worth keeping forever. Without this
+# the in-memory cache starts empty on every launch and each Windows boot
+# re-downloads the flag from the network exactly when the network is least
+# ready: the country name arrives with the geolocation response while the
+# flag stays a text placeholder for as long as the download takes.
+FLAG_CACHE_DIR = CONFIG_DIR / "flags"
+FLAG_CODE_PATTERN = re.compile(r"^[a-z]{2}$")
+FLAG_SIZE_PATTERN = re.compile(r"^\d{1,4}x\d{1,4}$")
 TRAY_FLAG_SIZE = "64x48"  # flagcdn asset used for the tray icon
 TRAY_ICON_PX = 64         # square canvas size for the tray icon
 RUN_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -734,11 +754,62 @@ def fetch_geo() -> tuple[Optional[GeoInfo], Optional[bool]]:
     return None, None
 
 
-def fetch_flag_png(country_code: str, size: str) -> Optional[bytes]:
+def _flag_cache_path(country_code: str, size: str) -> Optional[Path]:
+    """Path for a cached flag, or None if the identifiers are not safe.
+
+    The country code comes from a third-party API response, so it is treated
+    as untrusted input and must not be interpolated into a path unchecked.
+    """
+    if not FLAG_CODE_PATTERN.match(country_code) or not FLAG_SIZE_PATTERN.match(size):
+        return None
+    return FLAG_CACHE_DIR / f"{country_code}_{size}.png"
+
+
+def load_flag_from_disk(country_code: str, size: str) -> Optional[bytes]:
+    path = _flag_cache_path(country_code, size)
+    if path is None:
+        return None
     try:
-        return _http_get_body(FLAG_URL_TEMPLATE.format(size=size, cc=country_code))
+        data = path.read_bytes()
+    except OSError:
+        return None
+    return data if data.startswith(b"\x89PNG") else None  # ignore a truncated write
+
+
+def save_flag_to_disk(country_code: str, size: str, png: bytes) -> None:
+    path = _flag_cache_path(country_code, size)
+    if path is None:
+        return
+    try:
+        FLAG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        # Write then rename: a crash mid-write must not leave a half file
+        # that the next launch would read back as a corrupt image.
+        fd, tmp_path = tempfile.mkstemp(dir=FLAG_CACHE_DIR, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as tmp_file:
+                tmp_file.write(png)
+            os.replace(tmp_path, path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    except Exception:
+        LOG.debug("could not cache the flag for %s", country_code, exc_info=True)
+
+
+def fetch_flag_png(country_code: str, size: str) -> Optional[bytes]:
+    """Return the flag PNG, preferring the on-disk copy over the network."""
+    cached = load_flag_from_disk(country_code, size)
+    if cached is not None:
+        return cached
+    try:
+        png = _http_get_body(FLAG_URL_TEMPLATE.format(size=size, cc=country_code))
     except Exception:
         return None
+    save_flag_to_disk(country_code, size, png)
+    return png
 
 
 # ---------------------------------------------------------------------------

@@ -4,4 +4,12 @@ pystray>=0.19
 pillow>=10.0
 
 # Build only, not needed at runtime.
-# pyinstaller>=6.0
+#
+# PyInstaller must be 6.22+ on Python 3.14. Python 3.14 ships Tcl 9, whose
+# library lives inside a zipfs archive rather than a plain directory, and
+# 6.21 bundled a tkinter runtime hook that looked for a "_tcl_data" folder it
+# never collected. The build succeeded and the resulting exe died at startup
+# with FileNotFoundError before running a line of application code -- no
+# window, no log, and two processes that still reported as responding.
+#
+# pyinstaller>=6.22
